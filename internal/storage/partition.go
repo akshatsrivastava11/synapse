@@ -1,0 +1,156 @@
+package storage
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"sync"
+)
+
+type Partition struct {
+	mu              sync.RWMutex
+	id              int
+	dir             string
+	maxSegmentBytes int64
+	segments        []*Segment
+	nextOffset      int64
+}
+
+var segmentFilePattern = regexp.MustCompile(`^(\d{20})\.log$`)
+
+func OpenPartition(root string, id int, maxSegmentBytes int64) (*Partition, error) {
+	dir := filepath.Join(root, fmt.Sprintf("partition-%d", id))
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("open partition %d : %w", id, err)
+	}
+	starts, err := listSegmentStarts(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open partition %d : %w", id, err)
+
+	}
+	p := &Partition{
+		id:              id,
+		dir:             dir,
+		maxSegmentBytes: maxSegmentBytes,
+	}
+	if len(starts) == 0 {
+		seg, err := createSegment(dir, 0, maxSegmentBytes)
+		if err != nil {
+			return nil, err
+		}
+		p.segments = []*Segment{seg}
+		p.nextOffset = 0
+		return p, nil
+	}
+	for _, start := range starts {
+		seg, err := openSegment(dir, start, maxSegmentBytes)
+		if err != nil {
+			return nil, fmt.Errorf("open partition %d : recovering segment %d: %w", id, start, err)
+		}
+		p.segments = append(p.segments, seg)
+
+	}
+	last := p.segments[len(p.segments)-1]
+	p.nextOffset = last.startOffset + int64(last.recordCount())
+	return p, nil
+
+}
+
+func listSegmentStarts(dir string) ([]int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var starts []int64
+	for _, e := range entries {
+		m := segmentFilePattern.FindStringSubmatch(e.Name())
+		if m == nil {
+			continue
+		}
+		n, err := strconv.ParseInt(m[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		starts = append(starts, n)
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i] < starts[j] })
+	return starts, nil
+}
+
+func (p *Partition) Append(payload []byte) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	active := p.segments[len(p.segments)-1]
+	if active.shouldRoll() {
+		newSeg, err := createSegment(p.dir, p.nextOffset, p.maxSegmentBytes)
+		if err != nil {
+			return 0, fmt.Errorf("partition %d: roll segment: %w", p.id, err)
+		}
+		active = newSeg
+		p.segments = append(p.segments, active)
+	}
+	realIdx, err := active.append(payload)
+	if err != nil {
+		return 0, err
+	}
+	offset := active.startOffset + int64(realIdx)
+	p.nextOffset = offset + 1
+	return offset, nil
+}
+
+func (p *Partition) Sync() error {
+	p.mu.RLock()
+	active := p.segments[len(p.segments)-1]
+	p.mu.RUnlock()
+	return active.sync()
+}
+
+func (p *Partition) ReadFrom(offset int64) ([]byte, error) {
+	p.mu.RLock()
+	if offset < 0 || offset >= p.nextOffset {
+		p.mu.RUnlock()
+		return nil, fmt.Errorf("%w:offset %d,valid range [0,%d)", ErrOffsetOutOfRange, offset, p.nextOffset)
+	}
+	seg := p.findSegment(offset)
+	p.mu.RUnlock()
+	if seg == nil {
+		return nil, fmt.Errorf("%w: offset %d", ErrOffsetOutOfRange, offset)
+	}
+	return seg.readAt(int(offset - seg.startOffset))
+}
+
+func (p *Partition) findSegment(offset int64) *Segment {
+	i := sort.Search(len(p.segments), func(i int) bool {
+		return p.segments[i].startOffset > offset
+	})
+	if i == 0 {
+		return nil
+	}
+	return p.segments[i-1]
+}
+
+func (p *Partition) NextOffset() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.nextOffset
+}
+func (p *Partition) SegmentCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.segments)
+}
+
+func (p *Partition) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var firstErr error
+	for _, seg := range p.segments {
+		if err := seg.close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
