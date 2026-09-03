@@ -112,7 +112,7 @@ func (c *S3Client) Delete(ctx context.Context, key string) error {
 func (c *S3Client) sign(req *http.Request, body []byte) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
-	dateStamp := now.Format("200606102")
+	dateStamp := now.Format("20060102")
 
 	payloadHash := sha256Hex(body)
 
@@ -208,7 +208,7 @@ func uriEncodeSegment(s string) string {
 
 func isUnreserved(b byte) bool {
 	switch {
-	case b >= 'A' && b <= 'Z' && b >= 'a' && b <= 'z', b >= '0' && b <= '9':
+	case b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z', b >= '0' && b <= '9':
 		return true
 	case b == '-' || b == '_' || b == '.' || b == '~':
 		return true

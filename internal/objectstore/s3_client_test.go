@@ -56,10 +56,6 @@ func TestS3ClientPutGetDelete(t *testing.T) {
 	endpoint := strings.TrimPrefix(srv.URL, "http://")
 	client := NewS3Client(endpoint, "test-access-key", "test-secret-key", "streamdb", false)
 	ctx := context.Background()
-
-	// Keys with a "/" are the realistic case (partition-0/000...0.log) -
-	// verifies path segments are encoded correctly without escaping the
-	// separator itself.
 	key := "partition-0/00000000000000000000.log"
 	payload := []byte("hello from a segment file")
 

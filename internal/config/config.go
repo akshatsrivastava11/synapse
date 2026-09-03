@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 )
 
 type Config struct {
@@ -22,6 +23,8 @@ type Config struct {
 	S3UseSSL    bool
 
 	KafkaListenerAddr string
+	HTTPListenAddr    string // MVP produce/fetch HTTP API
+	FlushInterval     time.Duration
 }
 
 func Load() (Config, error) {
@@ -35,6 +38,8 @@ func Load() (Config, error) {
 		S3SecretKey:       getEnv("S3_SECRET_KEY", "minioadmin"),
 		S3UseSSL:          getEnvBool("S3_USE_SSL", false),
 		KafkaListenerAddr: getEnv("KAFKA_LISTEN_ADDR", ":9092"),
+		HTTPListenAddr:    getEnv("HTTP_LISTEN_ADDR", ":8080"),
+		FlushInterval:     getEnvDuration("FLUSH_INTERVAL", 5*time.Second),
 	}
 	if cfg.MaxSegmentBytes <= 0 {
 		return Config{}, fmt.Errorf("MAX_SEGMENT_BYTES must be positive, got %d", cfg.MaxSegmentBytes)
@@ -64,6 +69,16 @@ func getEnvBool(key string, fallback bool) bool {
 		b, err := strconv.ParseBool(v)
 		if err == nil {
 			return b
+		}
+	}
+	return fallback
+}
+
+func getEnvDuration(key string, fallback time.Duration) time.Duration {
+	if v, ok := os.LookupEnv(key); ok {
+		d, err := time.ParseDuration(v)
+		if err == nil {
+			return d
 		}
 	}
 	return fallback

@@ -1,6 +1,8 @@
 package storage
 
 import (
+	"akshat/synapse/internal/objectstore"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,13 +17,20 @@ type Partition struct {
 	id              int
 	dir             string
 	maxSegmentBytes int64
-	segments        []*Segment
-	nextOffset      int64
+	store           objectstore.ObjectStore
+
+	segments   []*Segment
+	nextOffset int64
+}
+
+type PartitionObject struct {
+	MaxSegmentBytes int64
+	Store           objectstore.ObjectStore
 }
 
 var segmentFilePattern = regexp.MustCompile(`^(\d{20})\.log$`)
 
-func OpenPartition(root string, id int, maxSegmentBytes int64) (*Partition, error) {
+func OpenPartition(root string, id int, opts PartitionObject) (*Partition, error) {
 	dir := filepath.Join(root, fmt.Sprintf("partition-%d", id))
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("open partition %d : %w", id, err)
@@ -34,10 +43,11 @@ func OpenPartition(root string, id int, maxSegmentBytes int64) (*Partition, erro
 	p := &Partition{
 		id:              id,
 		dir:             dir,
-		maxSegmentBytes: maxSegmentBytes,
+		maxSegmentBytes: opts.MaxSegmentBytes,
+		store:           opts.Store,
 	}
 	if len(starts) == 0 {
-		seg, err := createSegment(dir, 0, maxSegmentBytes)
+		seg, err := createSegment(dir, 0, opts.MaxSegmentBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -46,7 +56,7 @@ func OpenPartition(root string, id int, maxSegmentBytes int64) (*Partition, erro
 		return p, nil
 	}
 	for _, start := range starts {
-		seg, err := openSegment(dir, start, maxSegmentBytes)
+		seg, err := openSegment(dir, start, opts.MaxSegmentBytes)
 		if err != nil {
 			return nil, fmt.Errorf("open partition %d : recovering segment %d: %w", id, start, err)
 		}
@@ -108,7 +118,32 @@ func (p *Partition) Sync() error {
 	return active.sync()
 }
 
-func (p *Partition) ReadFrom(offset int64) ([]byte, error) {
+func (p *Partition) remoteKey(startOffset int64) string {
+	return fmt.Sprintf("partition-%d/%s", p.id, segmentFileName(startOffset))
+}
+
+func (p *Partition) FlushSealedSegments(ctx context.Context) (flushedCount int, err error) {
+	if p.store == nil {
+		return 0, nil
+	}
+	p.mu.RLock()
+	sealed := make([]*Segment, len(p.segments)-1)
+	copy(sealed, p.segments[:len(p.segments)-1])
+	p.mu.RUnlock()
+
+	for _, seg := range sealed {
+		key := p.remoteKey(seg.startOffset)
+		uploaded, err := seg.flush(ctx, p.store, key)
+		if err != nil {
+			return flushedCount, fmt.Errorf("partition %d: flush segment start=%d: %w", p.id, seg.startOffset, err)
+		}
+		if uploaded {
+			flushedCount++
+		}
+	}
+	return flushedCount, nil
+}
+func (p *Partition) ReadFrom(ctx context.Context, offset int64) ([]byte, error) {
 	p.mu.RLock()
 	if offset < 0 || offset >= p.nextOffset {
 		p.mu.RUnlock()
@@ -118,6 +153,11 @@ func (p *Partition) ReadFrom(offset int64) ([]byte, error) {
 	p.mu.RUnlock()
 	if seg == nil {
 		return nil, fmt.Errorf("%w: offset %d", ErrOffsetOutOfRange, offset)
+	}
+	if p.store != nil {
+		if err := seg.ensureLocal(ctx, p.store); err != nil {
+			return nil, fmt.Errorf("partition %d: ensure local for read at offset %d: %w", p.id, offset, err)
+		}
 	}
 	return seg.readAt(int(offset - seg.startOffset))
 }
@@ -141,6 +181,18 @@ func (p *Partition) SegmentCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.segments)
+}
+
+func (p *Partition) LocalSegmentCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, seg := range p.segments {
+		if !seg.isRemote() {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *Partition) Close() error {
